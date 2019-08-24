@@ -1,0 +1,809 @@
+---
+title: "House Case Study Report"
+author: "Yimei Chen, Chris Dong, Qian Li, Jing Song"
+date: "October 6, 2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE, warning = FALSE, message = FALSE, results = 'hide'}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading the data and any packages
+```{r, }
+options("max.print"=10)
+suppressMessages(library(tidyverse))
+suppressMessages(library(magrittr))
+suppressMessages(library(leaps))
+suppressMessages(library(VIM))
+suppressMessages(library(car))
+suppressMessages(library(Hmisc))
+suppressMessages(library(glmnet))
+suppressMessages(library(grid))
+suppressMessages(library(gridExtra))
+suppressMessages(library(ggcorrplot))
+suppressMessages(library(olsrr))
+house <- read_csv("housing.txt", col_types = cols())
+names(house) <- tolower(names(house))
+house0 <- house
+```
+
+# Part I Explanatory Modeling
+
+# Task 1
+
+**Exploratory Data Analysis**
+```{r, eval = F}
+p1 <- house %>% ggplot(aes(x=grlivarea, y = saleprice, 
+                      color = factor(kitchenqual))) + geom_point(alpha = 0.5) +
+  xlab("Above grade (ground) living area square feet") +
+  ylab("Price of the house") + scale_y_continuous(label=scales::comma) +
+  labs(colour = "Kitchen Quality") +
+  theme(legend.title = element_text(size = 10, face = "bold")) 
+p2 <- house %>% ggplot(aes(x=log(grlivarea), y = log(saleprice), 
+                      color = factor(kitchenqual))) + geom_point(alpha = 0.5) +
+  xlab("Log of Above grade (ground) living area square feet") +
+  ylab("Log of Price of the house") + scale_y_continuous(label=scales::comma) +
+  labs(colour = "Kitchen Quality") +
+  theme(legend.title = element_text(size = 10, face = "bold")) 
+
+grid.arrange(p1,p2,ncol=1)
+```
+
+
+```{r, eval = F}
+ggplot(house, aes(x=neighborhood,y=saleprice,color = factor(garagecars)))+geom_point(alpha = .5)+ theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("Neighborhood") +
+  ylab("Price of the house") + scale_y_continuous(label=scales::comma) +
+  labs(colour = "Garage Car Capacity") +
+  theme(legend.title = element_text(size = 10, face = "bold")) 
+```
+
+
+```{r,, eval = F}
+house0%>% ggplot(aes(x=yearbuilt, y = saleprice, 
+                      color = factor(roofstyle))) + geom_point(alpha = 0.5) +
+  xlab("Built Year") +
+  ylab("Price of the house") + scale_y_continuous(label=scales::comma) +
+  labs(colour = "Type of Roof") +
+  theme(legend.title = element_text(size = 10, face = "bold")) 
+```
+
+Convert `mssubclass` to factor and check for `NA`s
+```{r}
+house$mssubclass <- factor(house$mssubclass)
+house %>% sapply(function(x) sum(is.na(x))) %>% sort(decreasing = T)
+```
+
+Convert numeric variables that have `NA` to 0. Change `garageyrblt` to indicate whether or not the garage was built AFTER the house was built.
+```{r}
+house$masvnrarea[which(is.na(house$masvnrarea))] <- 0
+house$bsmtfintype1[which(is.na(house$bsmtfintype1))] <- 0
+house$bsmtfintype2[which(is.na(house$bsmtfintype2))] <- 0
+house$garageyrblt <- (house$garageyrblt > house$yearbuilt) * 1
+house$garageyrblt[is.na(house$garageyrblt)] <- 0
+```
+
+Impute the NA in `lotfrontage`, `electrical`  with K-Nearest Neighbors
+```{r,warning = FALSE, message = FALSE}
+
+k = round(sqrt(1460*.8) / 2)
+
+house$lotfrontage <- kNN(house, variable = "lotfrontage",  k = k)$lotfrontage
+house$electrical <- kNN(house, variable = "electrical",  k = k)$electrical
+```
+
+Convert all other `NA`s to "None"
+```{r}
+house[is.na(house)] <- "None"
+```
+
+Make a new variable, `remodel` that indicates whether or not remodeling took place. Remove the `yearremodadd` variable because it is no longer needed. Make a new variable `soldminusbuilt` that indicates the number of years that it took for the house to get sold after getting built.
+```{r, warning = F}
+house$remodel <- T
+house[house$yearbuilt == house$yearremodadd,]$remodel <- F
+house$remodel <- as.numeric(house$remodel)
+house %<>% select(-yearremodadd) 
+
+house$soldminusbuilt <- (house$yrsold - house$yearbuilt)
+house %<>% select(-yrsold,-yearbuilt) 
+```
+
+Combine all of the porch variables into one. Remove `id` because it is obviously not important.
+```{r}
+house$porcharea <- with(house, openporchsf + enclosedporch +
+    `3ssnporch` + screenporch)
+house %<>% select(-id) 
+```
+
+Change `lotshape` to a boolean whether or not it is Regular.
+```{r}
+table(house$lotshape)
+house$lotshape <- (house$lotshape == 'Reg') *1
+```
+
+Looking at the histogram of `mosold` we see many more houses being sold near summer time (and part of spring too) so we create a boolean. Most of the time, when we are creating a boolean, it is because it is insignificant otherwise.
+```{r, eval = F}
+house %>% ggplot(aes(x=mosold)) + geom_histogram(binwidth = 1) + xlim(0,13)+
+   xlab("Month Sold") +
+  ylab("Frequency")
+  
+house$summertime <- (house$mosold %in% 5:7) * 1
+```
+
+The next part of the code was very time-consuming but here's the general outline:
+It is similar to backwards selection but by hand and possibly more thorough because of the refactoring involved rather than simply removing it. 
+
+1. Check the p-value and signifiance for a particlar variable. 
+2. If the variable is numeric and significant, keep it. If the variable is categorical and all levels are significant, keep it. If only some levels are significant then try to bin the factors into smaller number of levels to try and make them statistically significant. If nothing can be done, then remove the variable.
+3. Repeat the above steps for the rest of the variables. Each time we remove a variable, we re-run the lm model to check if the Adjusted R Squared changed significantly or not.
+4. When we finish going through all the variables, there will be about 30 ones left to consider.
+
+```{r}
+house %<>% select(-mosold, -landcontour, -alley, -lotshape)
+```
+
+```{r}
+house$lotconfig <- (house$lotconfig == "Inside")  * 1
+house %<>% select(-lotconfig)
+```
+
+Here, we noticed `lotfrontage` became significant when we take the square root. We remove `1stflrsf`, `2ndflrsf`, `lowqualfinsf` because they make up the variable `grlivarea`. At first, we tried having all three of them and deleting `grlivarea` however we found that having just `grlivarea` performed better. We are deleting the porch variables because we have already aggregated them into `porcharea`.
+```{r}
+fullmodel <- lm(saleprice~sqrt(lotfrontage)+porcharea+.,data = house)
+summary(fullmodel)$r.squared
+
+house$condition1 <- relevel(factor(house$condition1), ref = "Norm")
+house$condition2 <- relevel(factor(house$condition2), ref = "Norm")
+
+house %<>% select(-roofstyle)
+house %<>% select(-exterior2nd)
+
+table(house$bldgtype)
+
+house <- house %>% select(-`1stflrsf`, -`2ndflrsf`, -lowqualfinsf,
+    -totalbsmtsf, -openporchsf, -enclosedporch, - `3ssnporch`,
+    - screenporch, -garagearea)
+
+table(house$salecondition)
+house$salecondition <- (house$salecondition == "Normal") * 1 
+
+table(house$saletype)
+house$saletype <- (house$saletype == 'New') * 1
+house <- house %>% select(-saletype)
+
+house$miscfeature <- (house$miscfeature != 'None') * 1
+house %<>% select(-miscval, -miscfeature) 
+
+house$paveddrive <- (house$paveddrive == 'Y') * 1
+house %<>% select(-paveddrive) 
+
+house$poolqc <- (house$poolqc !="None")*1
+house$fence <- (house$fence !="None")*1
+```
+
+Here, I am changing the ordered factor into numeric. I want to make a correlation plot with every significant variable so I am converting all variables (as long as it makes sense) to numeric.
+```{r}
+house$garagecond <-  as.numeric(factor(house$garagecond, 
+    levels = c("None","Po","Fa","TA","Gd","Ex"), labels = 0:5))
+house$garagequal <-  as.numeric(factor(house$garagequal, 
+    levels = c("None","Po","Fa","TA","Gd","Ex"), labels = 0:5))
+
+house %<>% select(-fence,-poolqc,-garagecond)
+
+house %>% group_by(garagefinish) %>% 
+summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc)) %>% head(2)
+house$garagefinish <-(house$garagefinish == "Fin") *1
+house %<>% select(-garagefinish)
+```
+
+Here, `fireplacequ` and `fireplaces` are obviously correlated so I choose the one that seems to explain `saleprice` better. However, they both end up being insignificant.
+```{r}
+house$fireplacequ <-  as.numeric(factor(house$fireplacequ,
+    levels = c("None","Po","Fa","TA","Gd","Ex"), labels = 0:5))
+cor(house$saleprice,house$fireplacequ); cor(house$saleprice,house$fireplaces)
+house %<>% select(-fireplacequ, -fireplaces)
+```
+
+```{r}
+house %<>% select(-garageyrblt)
+house$garagetype <- relevel(factor(house$garagetype), ref = "None")
+
+house$functional <- (house$functional == "Typ") * 1
+
+house$kitchenqual <-  as.numeric(factor(house$kitchenqual,
+    levels = c("Po","Fa","TA","Gd","Ex"), labels = 1:5))
+```
+
+Similarly, `totrmsabvgrd` is highly correlated with `grlivarea` so I keep the better of the two.
+```{r}
+cor(house$totrmsabvgrd ,house$saleprice);cor(house$grlivarea ,house$saleprice)
+house %<>% select(-totrmsabvgrd)
+```
+
+I try to combine all of the bath variables but they end up not being significant so I just remove them.
+```{r}
+table(house$fullbath)
+house$bath <- house$fullbath + house$halfbath + house$bsmtfullbath + house$bsmthalfbath
+house %<>% select(-fullbath,-halfbath, -bsmthalfbath, -bsmtfullbath)
+house %<>% select(-bath)
+```
+
+```{r}
+house %>% group_by(electrical) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc)) 
+house$electrical <- (house$electrical == "SBrkr") * 1
+house %<>% select(-electrical, -centralair)
+
+house$heatingqc <- as.numeric(factor(house$heatingqc,
+  levels = c("Po","Fa","TA","Gd","Ex"), labels = 1:5))
+table(house$heatingqc)
+house$heatingqc <- (house$heatingqc == 5) * 1
+
+house %<>% select(-heating)
+
+table(house$bsmtfintype1)
+
+house$bsmtfintype1 <- as.numeric(factor(house$bsmtfintype1,
+      levels = c("0","Unf","LwQ","Rec","BLQ","ALQ","GLQ"),
+      labels = 0:6))
+house$bsmtfintype2 <- as.numeric(factor(house$bsmtfintype2,
+      levels = c("0","Unf","LwQ","Rec","BLQ","ALQ","GLQ"),
+      labels = 0:6))
+house$bsmtfintype1 <- house$bsmtfintype1 + house$bsmtfintype2
+house %<>% select(-bsmtfintype1, -bsmtfintype2)
+
+
+house$bsmtexposure <- relevel(factor(house$bsmtexposure), ref = "None")
+
+table(house$bsmtexposure)
+
+house %>% group_by(bsmtexposure) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+house$bsmtexposure <- (house$bsmtexposure == "Gd") * 1
+
+house %>% group_by(bsmtcond) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+table(house$bsmtcond)
+
+house$bsmtcond <- as.numeric(factor(house$bsmtcond,
+      levels = c("None","Po","Fa","TA","Gd","Ex"),
+      labels = 0:5))
+
+house$bsmtqual <- as.numeric(factor(house$bsmtqual,
+      levels = c("None","Po","Fa","TA","Gd","Ex"),
+      labels = 0:5))
+cor(house$bsmtcond,house$bsmtqual)
+cor(house$bsmtcond,house$saleprice);cor(house$bsmtqual,house$saleprice)
+house %<>% select(-bsmtcond)
+house %<>% select(-bsmtqual)
+
+table(house$foundation)
+
+house %>% group_by(foundation) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+house$foundation <- (house$foundation == "PConc")*1
+
+house$extercond <- as.numeric(factor(house$extercond,
+      levels = c("Po","Fa","TA","Gd","Ex"),
+      labels = 1:5))
+house$exterqual <- as.numeric(factor(house$exterqual,
+      levels = c("Po","Fa","TA","Gd","Ex"),
+      labels = 1:5))
+cor(house$extercond,house$exterqual)
+
+house$masvnrtype <- relevel(factor(house$masvnrtype), ref = "None")
+
+table(house$masvnrtype)
+
+house$masvnrtype <- (house$masvnrtype != "None") * 1
+```
+
+Boolean whether or not housestyle is either `2Story` or `2.5Fin`.
+```{r}
+table(house$housestyle)
+
+house %>%  group_by(housestyle) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+house$housestyle <- (house$housestyle == "2Story" | 
+                    house$housestyle == "2.5Fin")*1
+
+table(house$bldgtype)
+
+house$bldgtype <- (house$bldgtype == "1Fam" | house$bldgtype == "2FmCon") * 1
+house %<>% select(-bldgtype)
+
+table(house$landslope)
+
+house$landslope <- (house$landslope == "Gtl") * 1
+house %<>% select(-landslope)
+
+table(house$utilities)
+house %<>% select(-utilities, -street)
+
+house %>%  group_by(mszoning) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+table(house$mszoning)
+
+house$mszoning <- relevel(factor(house$mszoning), ref = "RL")
+
+house %<>% select(-mszoning)
+
+house %>%  group_by(mssubclass) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+house %<>% select(-mssubclass, -lotfrontage, -porcharea, -extercond,-foundation,
+                  -exterior1st)
+
+
+house %>%  group_by(condition1) %>% summarise(avgprc = median(saleprice)) %>% arrange(desc(avgprc))
+
+house$condition1 <- (house$condition1 == "Artery" | house$condition1 =="Feedr"|
+  house$condition1 == "RRAe")*1
+house$condition2 <- (house$condition2 == "PosN") * 1
+
+cor(house$garagequal, house$garagecars)
+
+house %<>% select(-garagequal)
+
+fullmodel <- lm(saleprice~.,data = house)
+summary(fullmodel)
+```
+
+Checking multicollinearity. Looks good. For the generalized variance inflation factor (normalized by the degree of freedom), everything except one is less than 2. 
+```{r}
+vif(fullmodel)
+```
+
+Interestingly, `soldminusbuilt` which is `yrsold` - `yearbuilt` becomes insignificant in this smaller model with only the best predictors
+```{r}
+house_numeric <- house[,sapply(house,function(x) is.numeric(x))]
+house_numeric %<>% select(saleprice, everything())
+bestpredictors <- names(house_numeric)[sapply(house_numeric, 
+function(x) abs(cor(house_numeric$saleprice, x))) >= 0.5][-1]
+
+bestpredictors <- bestpredictors[-6]
+
+bestmodel <- lm(saleprice~overallqual + exterqual + grlivarea + 
+    kitchenqual + garagecars + neighborhood, data = house)
+
+summary(bestmodel)$r.squared
+```
+
+Subset with only best predictors
+```{r}
+housesubset <- house %>% select(bestpredictors)
+```
+
+So, 6 variables capture `r summary(bestmodel)$r.squared` of the variation in sale price for our model.
+
+Checking assumptions.
+
+```{r, eval = F}
+cor(housesubset)
+vif(bestmodel)
+
+g1 <- ggplot(housesubset, aes(sample = grlivarea)) +  stat_qq() + ggtitle("grlivarea")
+g2 <- ggplot(housesubset, aes(sample = log(grlivarea))) +  stat_qq() + ggtitle("log(grlivarea)")  
+
+g3 <- ggplot(house, aes(sample = saleprice)) +  stat_qq() + ggtitle("saleprice")
+g4 <- ggplot(house, aes(sample = log(saleprice))) +  stat_qq() + ggtitle("log(saleprice)")  
+grid.arrange(g1,g2,g3,g4)
+```
+
+```{r}
+bestmodel2 <- lm(log(saleprice)~overallqual  + exterqual +  log(grlivarea) + 
+    kitchenqual + garagecars + neighborhood, data = house)
+summary(bestmodel2)
+```
+
+`exterqual` becomes insignificant once we take the log of the response variable
+```{r}
+bestmodel3 <- lm(log(saleprice)~overallqual  +  log(grlivarea) + 
+    kitchenqual + garagecars + neighborhood, data = house)
+summary(bestmodel3)$r.squared
+```
+
+Check for high leverage points. There are 98 high leverage points.
+```{r, eval = F}
+( high_leverage <- as.numeric(names(hatvalues(bestmodel3)[(hatvalues(bestmodel3) > 2*ncol(house)/nrow(house))])) )
+
+lev_df <- data_frame(rstudent = rstudent(bestmodel3),
+                     hatvalue = hatvalues(bestmodel3))
+lev_df$highlev <- F
+lev_df[high_leverage,]$highlev <- T
+lev_df %>% ggplot(aes(x=hatvalue, y = rstudent,color = highlev)) + geom_point()+
+  xlab("Hat Values") +
+  ylab("Sstandardized Residuals") + scale_y_continuous(label=scales::comma) +
+  labs(colour = "High Leverage?") +
+  theme(legend.title = element_text(size = 10, face = "bold")) 
+
+length(hatvalues(bestmodel3)[(hatvalues(bestmodel3) > 2*ncol(house)/nrow(house))])
+
+hatvalues(bestmodel)[hatvalues(bestmodel3) > 0.5]
+
+```
+
+```{r}
+infm <- influence.measures(bestmodel3)
+threshhold <- sqrt(2*ncol(house)/nrow(house))
+```
+
+Check for influence points. There are 184 high influence points with a threshhold of $\sqrt{\frac{p}{n}}$ = `r threshhold`
+```{r}
+(high_influence <- which(abs(infm$infmat[,30])>threshhold))
+
+inf_df <- data_frame(dffits = dffits(bestmodel3), index = 1:nrow(house))
+inf_df$highinf <- F
+inf_df[high_influence,]$highinf <- T
+```
+```{r, eval = F}
+inf_df %>% ggplot(aes(x=index, y=dffits, color = highinf)) + geom_point() +
+    xlab("Observation Number") +
+  ylab("DFFITS") + scale_y_continuous(label=scales::comma) +
+  labs(colour = "High Influence Point?") +
+  theme(legend.title = element_text(size = 10, face = "bold")) 
+
+```
+
+
+```{r, results = 'hide', echo = F}
+#install.packages("olsrr")
+ols_dffits_plot <- function (model) {
+    if (!all(class(model) == "lm")) {
+        stop("Please specify a OLS linear regression model.", 
+            call. = FALSE)
+    }
+    dffitsm <- model %>% dffits() %>% unlist()
+    k <- length(model$coefficients)
+    n <- model %>% model.frame() %>% nrow()
+    dffits_t <- 2 * sqrt(k/n)
+    obs <- NULL
+    txt <- NULL
+    dbetas <- NULL
+    Observation <- NULL
+    d <- tibble(obs = seq_len(n), dbetas = dffitsm)
+    d$color <- ifelse(((d$dbetas >= dffits_t) | (d$dbetas <= 
+        -dffits_t)), c("outlier"), c("normal"))
+    d$color1 <- factor(d$color)
+    d$Observation <- ordered(d$color1, levels = c("normal", "outlier"))
+    d <- d %>% mutate(txt = ifelse(Observation == "outlier", 
+        obs, NA))
+    f <- d %>% filter(., Observation == "outlier") %>% select(obs, 
+        dbetas)
+    colnames(f) <- c("Observation", "DFFITs")
+    result <- list(outliers = f, threshold = round(dffits_t, 
+        2))
+    invisible(result)
+}
+```
+
+```{r}
+influence <- ols_dffits_plot(bestmodel3)
+```
+
+Let's examine Observation # 1299, and 524
+
+```{r}
+house[1299,] %>% View()
+house[542,] %>% View()
+
+bestmodel4 <- lm(log(saleprice)~overallqual  +  log(grlivarea) + 
+    kitchenqual + garagecars + neighborhood, data = house[c(-1299,-542),])
+summary(bestmodel4)$r.squared
+
+```
+
+By just removing two points, our Adjusted R-squared went from `r summary(bestmodel3)$adj.r.squared` to `r summary(bestmodel4)$adj.r.squared`
+
+There are 89 outliers.
+Let's see what happens if we simply remove the outliers.
+```{r}
+influenceindex <- unlist(influence$outliers[1])
+
+bestmodelnoinfluence <- lm(log(saleprice)~overallqual  +  log(grlivarea) + 
+    kitchenqual + garagecars + neighborhood, data = house[-influenceindex,])
+summary(bestmodelnoinfluence)$r.squared
+
+```
+
+We see that our Adjusted R-squared went from `r summary(bestmodel4)$adj.r.squared` to 
+`r summary(bestmodelnoinfluence)$adj.r.squared` after removing ALL the influence points.
+
+
+```{r}
+
+t1 <- names(house)[1:11]
+t2 <- names(house)[12:21]
+t2[11] <- ""
+t3 <- names(house)[22:31]
+t3[11] <- ""
+
+data_frame(t1,t2,t3) %>% 
+  knitr::kable(col.names = c("","",""))
+
+house2 <- house
+house2[influenceindex, ]$saleprice <- NA
+house2$saleprice <- kNN(house2, variable = "saleprice",  k = k)$saleprice
+```
+
+```{r}
+bestmodelimputeinfluence <- lm(log(saleprice)~overallqual  +  log(grlivarea) + 
+    kitchenqual + garagecars + neighborhood, data = house2)
+summary(bestmodelimputeinfluence)$r.squared
+```
+
+Let's try our model with all of the relevant variables. First, we notice that the R squared improves by taking the log of `saleprice`, `lotarea`, `grlivarea` and the square root of `bsmtfinsf1`. We also notice that `housestyle` and `masvnrtype` is no longer significant so we remove them.
+```{r}
+model31var <- lm(log(saleprice) ~ log(lotarea) + 
+                   sqrt(bsmtfinsf1)+log(grlivarea)+., data = house)
+summary(model31var)$r.squared
+```
+
+Accounting for outliers in the full model through imputation
+
+```{r}
+model31varimpute <- lm(log(saleprice) ~ log(lotarea) + 
+              sqrt(bsmtfinsf1)+log(grlivarea)+., data = house2)
+summary(model31varimpute)$r.squared
+```
+
+We can try removing the outliers, which improved the R squared by a lot. 
+
+I remove some variables found to be insignificant.
+```{r}
+house3 <- house2 %>% select(-condition2,-roofmatl,-garagetype,-poolarea,-remodel)
+```
+
+Remove `exterqual`
+```{r}
+house4 <- house3 %>% select(-exterqual)
+```
+
+
+Getting all of the numeric variables.
+```{r, fig.width = 12, fig.height = 11, , eval = F}
+
+house_numeric <- house4[,sapply(house4,function(x) is.numeric(x))]
+
+house_numeric %<>% select(saleprice, everything())
+#install.packages("ggcorrplot")
+
+cor_matrix <- cor(house_numeric) 
+
+ggcorrplot(cor_matrix, type = "lower", outline.col = "white", insig = "blank")
+
+```
+
+#FINAL MODEL
+I test the multicollinearity, significance of variables in the model, normality for our final model.
+```{r}
+endmodel <- lm(log(saleprice) ~ log(lotarea) + 
+              sqrt(bsmtfinsf1)+log(grlivarea) +  . -
+                lotarea - bsmtfinsf1 - grlivarea,
+              data = house4[-influenceindex,])
+vifmodel <- lm(log(saleprice) ~ log(lotarea) + 
+              sqrt(bsmtfinsf1)+log(grlivarea) +  . -
+                lotarea - bsmtfinsf1 - grlivarea - neighborhood,
+              data = house4[-influenceindex,])
+vif(vifmodel) %>% knitr::kable()
+
+options(max.print=999)
+summary(endmodel)
+ks.test(endmodel$residuals, pnorm, mean(endmodel$residuals),
+        sd(endmodel$residuals))
+
+ncvTest(endmodel)
+
+resid_df <- data_frame(res = endmodel$residuals)
+```
+
+```{r, eval = F}
+r1 <- ggplot(endmodel, aes(.fitted, .resid)) + geom_point() + xlab("Fitted Values") + ylab("Residuals")+
+  ggtitle("Residuals vs Fitted Values")
+
+r2 <- ggplot(endmodel, aes(qqnorm(.stdresid)[[1]], .stdresid)) + geom_point(na.rm = T) +geom_abline(intercept =0, slope =1) + xlab("Theoretical Quantiles") +
+  ylab("Standard Residuals") + ggtitle("QQ Residual Plot")
+
+grid.arrange(r1,r2,ncol=2)
+```
+
+Checking with LASSO if any variables to remove. Although LASSO recommends to delete `bsmtunsf` and `bedroomabvgr`, removing them lowers the R squared so I will keep them. Many of the neighborhoods are in fact significant so I will leave the non-significant levels in the model anyway.
+```{r}
+lassorefactor <- function(){
+  
+ x <- model.matrix(saleprice ~ ., data = house4)[,-1]
+ y <- house$saleprice
+ train <- sample(1:nrow(x), nrow(x) / 2)
+ test <- (-train)
+ y.train <- y[train]
+ y.test <- y[test]
+ grid.lambda <- 10^seq(10, -2, length = 100)
+ lasso.model <- glmnet(x, y, alpha = 1, lambda = grid.lambda)
+ set.seed(1)
+ cv.out <- cv.glmnet(x[train,], y.train, alpha = 1)
+ best.lambda <- cv.out$lambda.min
+ lasso.pred <- predict(lasso.model, s = best.lambda, newx = x[test,])
+ mspe.lasso <- mean((lasso.pred - y.test)^2)
+ final.model <- glmnet(x, y, alpha = 1, lambda = best.lambda)
+ c <- coef(final.model)
+ ind <- which(c==0)
+ variables <- row.names(c)[ind]
+ return(variables)
+}
+
+lassorefactor()
+```
+
+Thus, our final model includes the following variables:
+
+```{r}
+names(house4)
+```
+
+```{r}
+signif_var <- house4 %>% select(-neighborhood) %>% 
+  sapply(function(x) abs(cor(x,house4$saleprice)))
+
+signif_var[signif_var >= 0.5]
+summary(lm(log(saleprice)~log(grlivarea) +kitchenqual +garagecars + soldminusbuilt + overallqual, data = house4))
+```
+
+The five most relevant features that are most relevant in determining a house's sale price are `overallqual`, `grlivarea`, `kitchenqual`, `garagecars`, and
+`soldminusbuilt`. The fifth variable, `soldminusbuilt` is equal to `yearsold` - `yearbuilt`.
+
+#TASK 2
+```{r}
+morty<- read_csv("Morty.txt", col_types = cols())
+```
+
+##Function to transform TEST DATA accordingly. Please run the function transform() and provide the data frame to the argument
+
+```{r}
+transform <- function(df){
+  names(df) <- tolower(names(df))
+
+  df[is.na(df)] <- "None"
+  df$soldminusbuilt <- (df$yrsold - df$yearbuilt)
+  df$summertime <- (df$mosold %in% 5:7) * 1
+  df$saletype <- (df$saletype == 'New') * 1
+  
+  df %<>% select(intersect(names(df), names(house4)))
+  
+  df$condition1 <- (df$condition1 == "Artery" | 
+      df$condition1 =="Feedr"| df$condition1 == "RRAe")*1
+  
+  df$housestyle <- (df$housestyle == "2Story" | 
+                    df$housestyle == "2.5Fin")*1
+
+  df$masvnrtype <- (df$masvnrtype != "None") * 1
+  df$bsmtexposure <- (df$bsmtexposure == "Gd") * 1
+  
+  df$heatingqc <- as.numeric(factor(df$heatingqc,
+  levels = c("Po","Fa","TA","Gd","Ex"), labels = 1:5))
+  
+  df$kitchenqual <-  as.numeric(factor(df$kitchenqual,
+    levels = c("Po","Fa","TA","Gd","Ex"), labels = 1:5))
+  
+  df$functional <- (df$functional == "Typ") * 1
+  df$salecondition <- (df$salecondition == "Normal") * 1 
+  return(df)
+}
+morty2 <- transform(morty)
+```
+
+`morty2` is our transformed data. Note that it only has 25 variables
+```{r}
+confmorty <- exp(predict(endmodel, morty2, interval = "confidence", level = 0.95)) 
+confmorty %>% knitr::kable()
+```
+
+```{r}
+morty_stat <- as.numeric(unlist(morty2))
+names(morty_stat) <- names(morty2)
+mean_stat <- sapply(house4, function(x) round(mean(x)))
+
+morty_stat
+mean_stat
+
+(improve <- house4 %>% select(-neighborhood,-saleprice, -soldminusbuilt) %>%  sapply(function(x) abs(cor(x, house4$saleprice))) %>% sort(decreasing = T) )
+improve %>% knitr::kable()
+```
+
+`overallqual` and `kitchenqual` are in the top 3 for correlation with saleprice. `grlivarea` is difficult/nearly impossible to improve so we will move on to the next variable. 
+
+*Conclusion:* Morty should try to improve the `overallqual`, which is the overall material and finish of the house. This may mean repainting some areas on the house to make it look nicer. Morty currently has a rating of 5 out 10 (average rating is 6 out of 10) so there is definitely room for improvement. Next, Morty should improve `kitchenqual`, which is kitchen quality. Maybe, there can be some remodeling done or fixing anything that is either old, or possibly broken. Morty has a rating of 3 out of 5 compared to the average rating of 4 out of 5. Finally, he can increase `garagecars`. After doing some research, it is possible to extend a garage. Although we removed `garagearea` since it is correlated with `garagecars`, both have high correlation with salesprice so Morty can consider to extend his garage -- it may be worth the investment. 
+
+We believe that Morty can sell his house for a *maximum* of `r prettyNum(round(confmorty[3], digits=2), big.mark = ",")`. The 95 $\%$ confidence interval goes from `r prettyNum(round(confmorty[1], digits=2), big.mark = ",")` to `r prettyNum(round(confmorty[3], digits=2), big.mark = ",")` with an average of `r prettyNum(round(confmorty[2], digits=2), big.mark = ",")`.
+
+# Part II Predictive Modeling
+
+#### Ordinary Least Squares
+```{r}
+set.seed(1)
+train <- sample(nrow(house)*.8)
+test <- (-train)
+housetrain <- house4[train,]
+housetest <- house4[test,]
+
+OLS_train <- lm(log(saleprice) ~ log(lotarea) + 
+              sqrt(bsmtfinsf1)+log(grlivarea) +  . -
+                lotarea - bsmtfinsf1 - grlivarea,
+              data = housetrain[-influenceindex,])
+OLS_predict <- exp(predict(OLS_train, housetest, 
+      interval = "prediction", level = 0.95, type = "response"))
+prettyNum(mean((OLS_predict[,1] - housetrain$saleprice)^2), big.mark = ",")
+
+```
+
+#### Define the function to generate models for ridge, lasso and elastic net
+```{r}
+f <- formula(endmodel)
+model_func <- function(input_data, input_alpha){
+set.seed(1)
+x <- model.matrix(f, data = input_data)[,-1]
+y <- log(house$saleprice)
+train <- sample(nrow(house)*.8)
+test <- (-train)
+y.train <- y[train]
+y.test <- y[test]
+grid.lambda <- 10^seq(10, -2, length = 100)
+model.train <- glmnet(x[train, ], y.train, alpha = input_alpha, lambda = grid.lambda)
+set.seed(1)
+cv.out <- cv.glmnet(x[train,], y.train, alpha = input_alpha)
+best.lambda <- cv.out$lambda.min
+pred <- predict(model.train, s = best.lambda, newx = x[test,])
+mspe <- mean((exp(pred) - exp(y.test))^2)
+final.model <- glmnet(x, y, alpha = input_alpha, lambda = best.lambda)
+c <- coef(final.model)
+return(c(mspe, best.lambda, final.model))
+}
+```
+
+#### Ridge regression model, $\lambda$ set at 0
+```{r}
+ridge_result <- model_func(house4,0)
+ridge_mspe <- ridge_result[1]
+ridge_lambda <- unlist(ridge_result[2])
+prettyNum(ridge_mspe, big.mark = ",")
+```
+
+#### lasso regression model, lambda set at 1
+```{r}
+lasso_result <- model_func(house4,1)
+lasso_mspe <- lasso_result[1]
+lasso_lambda <- unlist(ridge_result[2])
+prettyNum(lasso_mspe, big.mark = ",")
+```
+
+
+####elastic net regression, lambda set at 0.5
+```{r}
+elastic_result <- model_func(house4,0.5)
+elastic_mspe <- elastic_result[1]
+elastic_lambda <- unlist(ridge_result[2])
+prettyNum(elastic_mspe, big.mark = ",")
+```
+
+$\lambda$ is chosen to determine whether we are performing Ridge ($\lambda = 0$ ), Lasso ($\lambda = 1$), Elastic Net ($\lambda = 0.5$). The tuning parameters in the respective models is chosen via cross validation after trying 100 different ones.
+```{r}
+help(cv.glmnet)
+```
+
+**Justification**
+
+Our ridge model performed the best and has the lowest MSPE. 
+
+```{r}
+countzero <- function(x){
+  sum(x==0)
+}
+sapply(house4, function(x) countzero(x))
+```
+
+Many of these are boolean variables, but we can see that `masvnrarea`, `bsmtfinsf`, `bsmtfinsf2`, and `bsmtunsf` all have zeros. We chose all of these variables because we found them to be statistically significant in our model.
+
+```{r}
+house4 %>% select(-neighborhood) %>% sapply(function(x) abs(cor(x, house4$saleprice))) %>% sort(decreasing = T)
+```
+
+Some variables have more impact than others but nevertheless they are statistically significant in our model so we keep them. Three of these variables are generated from other variables. We created `summertime` partly because of common sense and after plotting the distribution of houses being sold by month, we saw a peak in the summer months. This makes sense practically because people tend to have more time during the summer and thus are more likely to buy a house. Secondly, we created `soldminusbuilt` because we felt that the difference between `yearsold` and `yearbuilt` is more useful together rather than seperately. The third variable we created is a boolean for `saletype` to indicate a house that was "just constructed and sold", which from a common sense perspective, can make the house go much higher. Many of the variables are condensed into smaller levels. Many levels have very few observations so we feel they are not significant enough to have their own level. This helps to prevent overfitting when predicting new values. We chose to not have too many variables in our model to also prevent overfitting. We confirmed the validity of our variables through LASSO regression. Lasso didn't really eliminate any variables, which supports the statistical signifiance of our predictors. 
