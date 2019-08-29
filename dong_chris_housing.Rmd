@@ -3,8 +3,8 @@ title: "House Case Study Report"
 author: "Yimei Chen, Chris Dong, Qian Li, Jing Song"
 date: "October 6, 2017"
 output:
-  pdf_document: default
-  html_document: default
+ pdf_document: default
+ html_document: default
 ---
 
 ```{r setup, include=FALSE, warning = FALSE, message = FALSE, results = 'hide'}
